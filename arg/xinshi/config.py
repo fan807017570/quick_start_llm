@@ -4,8 +4,11 @@ MILVUS_HOST = os.environ.get("MILVUS_HOST", "localhost")
 MILVUS_PORT = os.environ.get("MILVUS_PORT", "19530")
 COLLECTION_NAME = os.environ.get("MILVUS_COLLECTION", "Xinshi_school")
 
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "BAAI/bge-base-zh-v1.5")
-RERANK_MODEL = os.environ.get("RERANK_MODEL", "BAAI/bge-reranker-large")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "./models/bge-base-zh-v1.5")
+EMBEDDING_MODEL_CACHE_DIR = os.environ.get("EMBEDDING_MODEL_CACHE_DIR", "./models")
+
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "./models/bge-reranker-large")
+RERANK_MODEL_CACHE_DIR = os.environ.get("RERANK_MODEL_CACHE_DIR", "models")
 
 TOP_K_RETRIEVE = 20
 TOP_K_RERANK = 5

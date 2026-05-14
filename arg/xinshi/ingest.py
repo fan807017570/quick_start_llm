@@ -89,7 +89,9 @@ def ingest():
     log.info("split into %d chunk(s) in %.3fs", len(final_docs), time.perf_counter() - t0)
 
     t_emb = time.perf_counter()
-    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL,
+                                       model_kwargs={'device': 'cpu'},
+                                       encode_kwargs={'normalize_embeddings': True})
     log.info("embeddings model ready in %.3fs", time.perf_counter() - t_emb)
 
     t_mv = time.perf_counter()

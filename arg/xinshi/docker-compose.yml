@@ -11,6 +11,10 @@ version: "3.9"
 #   MILVUS_EXPOSED_PORT=19531
 #   MINIO_API_PORT=19000
 #   MINIO_UI_PORT=19001
+#   XINSHI_BASE_DATA_DIR=./data/base   # ingest.py 读取知识库 Markdown
+#   XINSHI_DOCS_DATA_DIR=./data/docs   # Web 上传/列举文档目录
+#   XINSHI_EMBEDDING_MODEL_DIR=./models/bge-base-zh-v1.5
+#   XINSHI_RERANK_MODEL_DIR=./models/bge-reranker-large
 
 services:
   xinshi-rag:
@@ -32,6 +36,14 @@ services:
       - XINSHI_LOG_LEVEL=INFO
     volumes:
       - hf_cache:/app/hf_cache
+      # 宿主机知识库目录 -> 容器 ingest 读取目录
+      - "${XINSHI_BASE_DATA_DIR:-./data/base}:/app/arg/xinshi/data/base:ro"
+      # 宿主机上传目录 -> 容器 Web 上传/列举目录
+      - "${XINSHI_DOCS_DATA_DIR:-./data/docs}:/app/arg/xinshi/data/docs"
+      # 宿主机 embedding 模型目录 -> 容器 ingest/retriever 读取目录
+      - "${XINSHI_EMBEDDING_MODEL_DIR:-./models/bge-base-zh-v1.5}:/app/models/bge-base-zh-v1.5:ro"
+      # 宿主机 rerank 模型目录 -> 容器 reranker 读取目录
+      - "${XINSHI_RERANK_MODEL_DIR:-./models/bge-reranker-large}:/app/models/bge-reranker-large:ro"
     depends_on:
       milvus-standalone:
         condition: service_healthy

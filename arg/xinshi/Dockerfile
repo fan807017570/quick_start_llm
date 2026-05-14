@@ -36,6 +36,17 @@ RUN pip install --no-cache-dir \
 # 复制完整项目（保持包结构 arg/xinshi/...）
 COPY arg/ /app/arg/
 
+# 宿主机资料挂载点：
+#   - /app/arg/xinshi/data/base：ingest.py 读取知识库 Markdown
+#   - /app/arg/xinshi/data/docs：Web 上传/列举文档
+# 运行示例：
+#   docker run --rm -p 18765:8765 \
+#     -v /宿主机/知识库目录:/app/arg/xinshi/data/base:ro \
+#     -v /宿主机/上传目录:/app/arg/xinshi/data/docs \
+#     xinshi-rag:latest
+RUN mkdir -p /app/arg/xinshi/data/base /app/arg/xinshi/data/docs
+VOLUME ["/app/arg/xinshi/data/base", "/app/arg/xinshi/data/docs"]
+
 # 确保包可被 Python 发现
 ENV PYTHONPATH=/app
 
