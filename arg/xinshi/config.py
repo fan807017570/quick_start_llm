@@ -12,6 +12,10 @@ RERANK_MODEL_CACHE_DIR = os.environ.get("RERANK_MODEL_CACHE_DIR", "models")
 RERANK_BATCH_SIZE = max(1, int(os.environ.get("RERANK_BATCH_SIZE", "64")))
 RERANK_MAX_LENGTH = max(64, int(os.environ.get("RERANK_MAX_LENGTH", "256")))
 RERANK_BACKEND = os.environ.get("RERANK_BACKEND", "torch")
+RERANK_CANDIDATE_LIMIT = max(1, int(os.environ.get("RERANK_CANDIDATE_LIMIT", "8")))
+RERANK_QUERY_CHAR_LIMIT = max(16, int(os.environ.get("RERANK_QUERY_CHAR_LIMIT", "256")))
+RERANK_DOC_CHAR_LIMIT = max(64, int(os.environ.get("RERANK_DOC_CHAR_LIMIT", "800")))
+RERANK_SCORE_CACHE_SIZE = max(0, int(os.environ.get("RERANK_SCORE_CACHE_SIZE", "4096")))
 
 TOP_K_RETRIEVE = 20
 TOP_K_RERANK = 5
