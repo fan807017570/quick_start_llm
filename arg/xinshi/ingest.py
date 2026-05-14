@@ -58,10 +58,10 @@ def ingest():
         ("###", "h3"),
     ]
     md_splitter = MarkdownHeaderTextSplitter(headers)
-    chunk_size = 500
+    chunk_size = 256
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=chunk_size,
-        chunk_overlap=100,
+        chunk_overlap=80,
     )
     final_docs = []
 
