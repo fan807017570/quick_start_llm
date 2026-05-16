@@ -100,12 +100,22 @@ app.add_middleware(
 
 
 async def _read_json_body(request: Request) -> dict:
+    raw = await request.body()
+    raw_text = raw.decode("utf-8", errors="replace")
+    log.info(
+        "wechat request raw body len=%d content_type=%r preview=%r",
+        len(raw),
+        request.headers.get("content-type"),
+        raw_text[:1000],
+    )
     try:
-        payload = await request.json()
+        payload = json.loads(raw_text)
     except json.JSONDecodeError as exc:
+        log.warning("wechat request body is not valid JSON: %s", exc)
         raise HTTPException(status_code=400, detail="请求体不是合法 JSON") from exc
 
     if not isinstance(payload, dict):
+        log.warning("wechat request JSON body is not object: type=%s", type(payload).__name__)
         raise HTTPException(status_code=400, detail="请求体 JSON 必须是对象")
     return payload
 
@@ -141,6 +151,7 @@ async def chat_wechat_message(
     except WeChatSignatureError:
         return PlainTextResponse("", status_code=403)
     except (WeChatCryptoError, WeChatPayloadError) as exc:
+        log.warning("wechat request rejected: status=%s detail=%s", exc.status_code, exc.detail)
         raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except Exception as e:
         log.exception("wechat message chat dispatch error: %s", e)

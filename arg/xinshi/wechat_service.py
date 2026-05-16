@@ -50,8 +50,8 @@ def build_encrypted_chat_reply(
     openid: str | None,
     signature_present: bool,
 ) -> dict | None:
-    encrypt = _extract_encrypt(payload)
     log.info("wechat request encrypted payload=%s", _json_for_log(payload))
+    encrypt = _extract_encrypt(payload)
     if not verify_msg_signature(msg_signature, timestamp, nonce, encrypt):
         log.warning(
             "invalid WeChat msg_signature timestamp=%s nonce=%s openid=%s signature_ignored=%s",
