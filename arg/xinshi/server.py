@@ -15,17 +15,12 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import hmac
 import json
 import logging
-import os
 import re
 import sys
 import time
-from xml.etree import ElementTree
 from pathlib import Path
-from typing import Literal
 
 # 保证可解析包 arg.xinshi
 _ROOT = Path(__file__).resolve().parent.parent.parent
@@ -39,15 +34,23 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel, Field
 
-from arg.xinshi.config import MAX_HISTORY_MESSAGES
-from arg.xinshi.logutil import configure_logging, preview_text
+from arg.xinshi.chat_service import (
+    handle_chat_request,
+    is_non_natural_language_message,
+    iter_stream_chat_events,
+)
+from arg.xinshi.logutil import configure_logging
+from arg.xinshi.schemas import ChatRequest, ChatResponse
+from arg.xinshi.wechat_crypto import WeChatCryptoError, verify_url_signature
+from arg.xinshi.wechat_service import (
+    WeChatPayloadError,
+    WeChatSignatureError,
+    build_encrypted_chat_reply,
+)
 
 configure_logging()
 log = logging.getLogger(__name__)
-
-from arg.xinshi.application import answer_question, stream_answer_question
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DOCS_DIR = Path(__file__).resolve().parent / "data" / "docs"
@@ -57,13 +60,6 @@ DOCS_DIR.mkdir(parents=True, exist_ok=True)
 _ALLOWED_SUFFIXES = {".md", ".txt"}
 # 安全文件名：只允许字母、数字、连字符、下划线、点
 _SAFE_FILENAME_RE = re.compile(r"^[\w\-. ]+$")
-_MACHINE_TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+=:/-]+$")
-_HEX_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{8,}$")
-_BASE64ISH_TOKEN_RE = re.compile(r"^[A-Za-z0-9+/]{12,}={0,2}$")
-_UUID_RE = re.compile(
-    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
-)
-_WECHAT_TOKEN_ENV = "WECHAT_TOKEN"
 
 app = FastAPI(title="新实中学招生顾问", version="1.0")
 
@@ -103,141 +99,15 @@ app.add_middleware(
 )
 
 
-class ChatMessage(BaseModel):
-    role: Literal["user", "assistant"]
-    content: str = Field(..., max_length=32000)
-
-
-class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, description="当前用户问题")
-    history: list[ChatMessage] = Field(
-        default_factory=list,
-        description="本轮之前的对话，按时间顺序；不含当前 message",
-    )
-    use_rewrite: bool = Field(True, description="是否做指代消解后再做检索同义词扩展")
-
-
-class ChatResponse(BaseModel):
-    answer: str
-    sources: list[str]
-    rewritten_query: str | None = None
-    standalone_query: str | None = Field(
-        None,
-        description="多轮时指代消解后的检索句（再经同义词扩展后用于 Milvus）",
-    )
-
-
-def _verify_wechat_signature(signature: str, timestamp: str, nonce: str) -> bool:
-    token = os.environ.get(_WECHAT_TOKEN_ENV, "").strip()
-    if not token:
-        log.warning("%s is not configured; reject WeChat validation request", _WECHAT_TOKEN_ENV)
-        return False
-
-    raw = "".join(sorted([token, timestamp, nonce]))
-    expected = hashlib.sha1(raw.encode("utf-8")).hexdigest()
-    return hmac.compare_digest(expected, signature)
-
-
-def _is_non_natural_language_message(message: str) -> bool:
-    text = message.strip()
-    if not text:
-        return True
-    if re.search(r"[\u4e00-\u9fff]", text):
-        return False
-    if re.search(r"\s", text):
-        return False
-    if any(ch in "?!！？" for ch in text):
-        return False
-
-    if _UUID_RE.fullmatch(text) or text.isdigit() or _HEX_TOKEN_RE.fullmatch(text):
-        return True
-    if _BASE64ISH_TOKEN_RE.fullmatch(text):
-        return True
-    if _MACHINE_TOKEN_RE.fullmatch(text):
-        has_digit = any(ch.isdigit() for ch in text)
-        has_separator = any(ch in "._~+=:/-" for ch in text)
-        return len(text) >= 16 or (has_digit and len(text) >= 6) or has_separator
-    return not any(ch.isalpha() for ch in text)
-
-
-def _direct_chat_response(message: str) -> ChatResponse:
-    text = message.strip()
-    return ChatResponse(
-        answer=text,
-        sources=[],
-        rewritten_query=None,
-        standalone_query=None,
-    )
-
-
-def _parse_wechat_xml_message(xml_body: bytes) -> dict[str, str]:
-    if len(xml_body) > 1024 * 1024:
-        raise HTTPException(status_code=413, detail="XML 报文过大")
-
+async def _read_json_body(request: Request) -> dict:
     try:
-        root = ElementTree.fromstring(xml_body)
-    except ElementTree.ParseError as exc:
-        raise HTTPException(status_code=400, detail="XML 报文格式错误") from exc
+        payload = await request.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail="请求体不是合法 JSON") from exc
 
-    def text_of(tag: str) -> str:
-        return (root.findtext(tag) or "").strip()
-
-    return {
-        "to_user": text_of("ToUserName"),
-        "from_user": text_of("FromUserName"),
-        "create_time": text_of("CreateTime"),
-        "msg_type": text_of("MsgType"),
-        "content": text_of("Content"),
-        "msg_id": text_of("MsgId"),
-        "msg_data_id": text_of("MsgDataId"),
-        "idx": text_of("Idx"),
-    }
-
-
-def _cdata(text: str) -> str:
-    return f"<![CDATA[{text.replace(']]>', ']]]]><![CDATA[>')}]]>"
-
-
-def _wechat_text_reply(to_user: str, from_user: str, content: str) -> str:
-    return (
-        "<xml>"
-        f"<ToUserName>{_cdata(to_user)}</ToUserName>"
-        f"<FromUserName>{_cdata(from_user)}</FromUserName>"
-        f"<CreateTime>{int(time.time())}</CreateTime>"
-        f"<MsgType>{_cdata('text')}</MsgType>"
-        f"<Content>{_cdata(content)}</Content>"
-        "</xml>"
-    )
-
-
-def _handle_chat_request(req: ChatRequest) -> ChatResponse:
-    if _is_non_natural_language_message(req.message):
-        log.info(
-            "chat short-circuited non-natural message_len=%d preview=%r",
-            len(req.message),
-            preview_text(req.message, 80),
-        )
-        return _direct_chat_response(req.message)
-
-    hist = [m.model_dump() for m in req.history[-MAX_HISTORY_MESSAGES:]]
-    log.info(
-        "chat request use_rewrite=%s history=%d message_len=%d preview=%r",
-        req.use_rewrite,
-        len(hist),
-        len(req.message),
-        preview_text(req.message, 80),
-    )
-    out = answer_question(
-        req.message.strip(),
-        history=hist,
-        use_rewrite=req.use_rewrite,
-    )
-    return ChatResponse(
-        answer=out["answer"],
-        sources=out["sources"],
-        rewritten_query=out.get("rewritten_query"),
-        standalone_query=out.get("standalone_query"),
-    )
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="请求体 JSON 必须是对象")
+    return payload
 
 
 @app.get("/api/health")
@@ -248,49 +118,37 @@ async def health():
 @app.post("/api/chat")
 async def chat_wechat_message(
     request: Request,
-    signature: str | None = Query(None, description="微信加密签名"),
-    timestamp: str | None = Query(None, description="时间戳"),
-    nonce: str | None = Query(None, description="随机数"),
+    msg_signature: str = Query(..., description="微信消息体签名"),
+    timestamp: str = Query(..., description="时间戳"),
+    nonce: str = Query(..., description="随机数"),
+    signature: str | None = Query(None, description="微信 URL 签名，POST 加密消息不使用"),
+    openid: str | None = Query(None, description="微信 openid"),
+    encrypt_type: str | None = Query(None, description="加密类型"),
 ):
-    signature_parts = (signature, timestamp, nonce)
-    if any(signature_parts):
-        is_valid_signature = all(signature_parts) and _verify_wechat_signature(
-            signature or "",
-            timestamp or "",
-            nonce or "",
-        )
-        if not is_valid_signature:
-            log.warning("invalid WeChat POST signature timestamp=%s nonce=%s", timestamp, nonce)
-            return PlainTextResponse("", status_code=403)
+    if encrypt_type and encrypt_type != "aes":
+        raise HTTPException(status_code=400, detail="仅支持 encrypt_type=aes")
 
-    body = await request.body()
-    msg = _parse_wechat_xml_message(body)
-    if msg["msg_type"] and msg["msg_type"] != "text":
-        log.info("ignore unsupported WeChat msg_type=%s msg_id=%s", msg["msg_type"], msg["msg_id"])
-        return PlainTextResponse("")
-    if not msg["content"]:
-        raise HTTPException(status_code=400, detail="XML 报文缺少 Content")
-
-    log.info(
-        "wechat message received from=%s to=%s msg_id=%s content_len=%d preview=%r",
-        msg["from_user"],
-        msg["to_user"],
-        msg["msg_id"],
-        len(msg["content"]),
-        preview_text(msg["content"], 80),
-    )
+    payload = await _read_json_body(request)
     try:
-        chat_resp = _handle_chat_request(ChatRequest(message=msg["content"]))
+        encrypted_reply = build_encrypted_chat_reply(
+            payload,
+            msg_signature=msg_signature,
+            timestamp=timestamp,
+            nonce=nonce,
+            openid=openid,
+            signature_present=bool(signature),
+        )
+    except WeChatSignatureError:
+        return PlainTextResponse("", status_code=403)
+    except (WeChatCryptoError, WeChatPayloadError) as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
     except Exception as e:
         log.exception("wechat message chat dispatch error: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
-    reply_xml = _wechat_text_reply(
-        to_user=msg["from_user"],
-        from_user=msg["to_user"],
-        content=chat_resp.answer,
-    )
-    return PlainTextResponse(reply_xml, media_type="application/xml; charset=utf-8")
+    if encrypted_reply is None:
+        return PlainTextResponse("success")
+    return JSONResponse(content=encrypted_reply)
 
 
 @app.get("/api/chat", response_model=ChatResponse)
@@ -300,7 +158,7 @@ async def chat_wechat_validation(
     nonce: str = Query(..., description="随机数"),
     echostr: str = Query(..., description="随机字符串"),
 ):
-    if not _verify_wechat_signature(signature, timestamp, nonce):
+    if not verify_url_signature(signature, timestamp, nonce):
         log.warning(
             "invalid WeChat signature timestamp=%s nonce=%s echostr_len=%d",
             timestamp,
@@ -310,12 +168,12 @@ async def chat_wechat_validation(
         return PlainTextResponse("", status_code=403)
 
     log.info("valid WeChat signature; dispatch echostr to chat handler len=%d", len(echostr))
-    if _is_non_natural_language_message(echostr):
+    if is_non_natural_language_message(echostr):
         log.info("return non-natural WeChat echostr directly")
         return PlainTextResponse(echostr)
 
     try:
-        return _handle_chat_request(ChatRequest(message=echostr))
+        return handle_chat_request(ChatRequest(message=echostr))
     except Exception as e:
         log.exception("wechat validation chat dispatch error: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -323,29 +181,12 @@ async def chat_wechat_validation(
 
 @app.post("/api/chat/stream")
 async def chat_stream(req: ChatRequest):
-    hist = [m.model_dump() for m in req.history[-MAX_HISTORY_MESSAGES:]]
-    log.info(
-        "chat_stream request use_rewrite=%s history=%d message_len=%d preview=%r",
-        req.use_rewrite,
-        len(hist),
-        len(req.message),
-        preview_text(req.message, 80),
-    )
-
     def _sse(payload: dict) -> str:
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     def _iter_events():
-        try:
-            for item in stream_answer_question(
-                req.message.strip(),
-                history=hist,
-                use_rewrite=req.use_rewrite,
-            ):
-                yield _sse(item)
-        except Exception as exc:
-            log.exception("chat_stream endpoint error: %s", exc)
-            yield _sse({"type": "error", "detail": str(exc)})
+        for item in iter_stream_chat_events(req):
+            yield _sse(item)
 
     headers = {
         "Cache-Control": "no-cache",
