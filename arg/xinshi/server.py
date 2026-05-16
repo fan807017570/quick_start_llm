@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import time
+from xml.etree import ElementTree
 from pathlib import Path
 from typing import Literal
 
@@ -169,6 +170,46 @@ def _direct_chat_response(message: str) -> ChatResponse:
     )
 
 
+def _parse_wechat_xml_message(xml_body: bytes) -> dict[str, str]:
+    if len(xml_body) > 1024 * 1024:
+        raise HTTPException(status_code=413, detail="XML 报文过大")
+
+    try:
+        root = ElementTree.fromstring(xml_body)
+    except ElementTree.ParseError as exc:
+        raise HTTPException(status_code=400, detail="XML 报文格式错误") from exc
+
+    def text_of(tag: str) -> str:
+        return (root.findtext(tag) or "").strip()
+
+    return {
+        "to_user": text_of("ToUserName"),
+        "from_user": text_of("FromUserName"),
+        "create_time": text_of("CreateTime"),
+        "msg_type": text_of("MsgType"),
+        "content": text_of("Content"),
+        "msg_id": text_of("MsgId"),
+        "msg_data_id": text_of("MsgDataId"),
+        "idx": text_of("Idx"),
+    }
+
+
+def _cdata(text: str) -> str:
+    return f"<![CDATA[{text.replace(']]>', ']]]]><![CDATA[>')}]]>"
+
+
+def _wechat_text_reply(to_user: str, from_user: str, content: str) -> str:
+    return (
+        "<xml>"
+        f"<ToUserName>{_cdata(to_user)}</ToUserName>"
+        f"<FromUserName>{_cdata(from_user)}</FromUserName>"
+        f"<CreateTime>{int(time.time())}</CreateTime>"
+        f"<MsgType>{_cdata('text')}</MsgType>"
+        f"<Content>{_cdata(content)}</Content>"
+        "</xml>"
+    )
+
+
 def _handle_chat_request(req: ChatRequest) -> ChatResponse:
     if _is_non_natural_language_message(req.message):
         log.info(
@@ -204,13 +245,52 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+@app.post("/api/chat")
+async def chat_wechat_message(
+    request: Request,
+    signature: str | None = Query(None, description="微信加密签名"),
+    timestamp: str | None = Query(None, description="时间戳"),
+    nonce: str | None = Query(None, description="随机数"),
+):
+    signature_parts = (signature, timestamp, nonce)
+    if any(signature_parts):
+        is_valid_signature = all(signature_parts) and _verify_wechat_signature(
+            signature or "",
+            timestamp or "",
+            nonce or "",
+        )
+        if not is_valid_signature:
+            log.warning("invalid WeChat POST signature timestamp=%s nonce=%s", timestamp, nonce)
+            return PlainTextResponse("", status_code=403)
+
+    body = await request.body()
+    msg = _parse_wechat_xml_message(body)
+    if msg["msg_type"] and msg["msg_type"] != "text":
+        log.info("ignore unsupported WeChat msg_type=%s msg_id=%s", msg["msg_type"], msg["msg_id"])
+        return PlainTextResponse("")
+    if not msg["content"]:
+        raise HTTPException(status_code=400, detail="XML 报文缺少 Content")
+
+    log.info(
+        "wechat message received from=%s to=%s msg_id=%s content_len=%d preview=%r",
+        msg["from_user"],
+        msg["to_user"],
+        msg["msg_id"],
+        len(msg["content"]),
+        preview_text(msg["content"], 80),
+    )
     try:
-        return _handle_chat_request(req)
+        chat_resp = _handle_chat_request(ChatRequest(message=msg["content"]))
     except Exception as e:
-        log.exception("chat endpoint error: %s", e)
+        log.exception("wechat message chat dispatch error: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+    reply_xml = _wechat_text_reply(
+        to_user=msg["from_user"],
+        from_user=msg["to_user"],
+        content=chat_resp.answer,
+    )
+    return PlainTextResponse(reply_xml, media_type="application/xml; charset=utf-8")
 
 
 @app.get("/api/chat", response_model=ChatResponse)
