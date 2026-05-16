@@ -56,6 +56,12 @@ DOCS_DIR.mkdir(parents=True, exist_ok=True)
 _ALLOWED_SUFFIXES = {".md", ".txt"}
 # 安全文件名：只允许字母、数字、连字符、下划线、点
 _SAFE_FILENAME_RE = re.compile(r"^[\w\-. ]+$")
+_MACHINE_TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+=:/-]+$")
+_HEX_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{8,}$")
+_BASE64ISH_TOKEN_RE = re.compile(r"^[A-Za-z0-9+/]{12,}={0,2}$")
+_UUID_RE = re.compile(
+    r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+)
 _WECHAT_TOKEN_ENV = "WECHAT_TOKEN"
 
 app = FastAPI(title="新实中学招生顾问", version="1.0")
@@ -131,7 +137,47 @@ def _verify_wechat_signature(signature: str, timestamp: str, nonce: str) -> bool
     return hmac.compare_digest(expected, signature)
 
 
+def _is_non_natural_language_message(message: str) -> bool:
+    text = message.strip()
+    if not text:
+        return True
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return False
+    if re.search(r"\s", text):
+        return False
+    if any(ch in "?!！？" for ch in text):
+        return False
+
+    if _UUID_RE.fullmatch(text) or text.isdigit() or _HEX_TOKEN_RE.fullmatch(text):
+        return True
+    if _BASE64ISH_TOKEN_RE.fullmatch(text):
+        return True
+    if _MACHINE_TOKEN_RE.fullmatch(text):
+        has_digit = any(ch.isdigit() for ch in text)
+        has_separator = any(ch in "._~+=:/-" for ch in text)
+        return len(text) >= 16 or (has_digit and len(text) >= 6) or has_separator
+    return not any(ch.isalpha() for ch in text)
+
+
+def _direct_chat_response(message: str) -> ChatResponse:
+    text = message.strip()
+    return ChatResponse(
+        answer=text,
+        sources=[],
+        rewritten_query=None,
+        standalone_query=None,
+    )
+
+
 def _handle_chat_request(req: ChatRequest) -> ChatResponse:
+    if _is_non_natural_language_message(req.message):
+        log.info(
+            "chat short-circuited non-natural message_len=%d preview=%r",
+            len(req.message),
+            preview_text(req.message, 80),
+        )
+        return _direct_chat_response(req.message)
+
     hist = [m.model_dump() for m in req.history[-MAX_HISTORY_MESSAGES:]]
     log.info(
         "chat request use_rewrite=%s history=%d message_len=%d preview=%r",
@@ -184,6 +230,10 @@ async def chat_wechat_validation(
         return PlainTextResponse("", status_code=403)
 
     log.info("valid WeChat signature; dispatch echostr to chat handler len=%d", len(echostr))
+    if _is_non_natural_language_message(echostr):
+        log.info("return non-natural WeChat echostr directly")
+        return PlainTextResponse(echostr)
+
     try:
         return _handle_chat_request(ChatRequest(message=echostr))
     except Exception as e:
