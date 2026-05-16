@@ -17,6 +17,25 @@ log = logging.getLogger(__name__)
 
 _DOCS_DIR = Path(__file__).resolve().parent / "data" / "base"
 
+_TEACHER_KEYWORDS = (
+    "老师", "教师", "班主任", "师资", "教职工", "名师", "教学", "校长"
+)
+_STUDENT_KEYWORDS = (
+    "学生", "同学", "学子", "招生", "报名", "班级", "宿舍", "食宿"
+)
+
+
+def _infer_audience_role(section: str, content: str) -> str:
+    """给 chunk 打粗粒度角色标签，便于检索阶段按意图过滤。"""
+    text = f"{section}\n{content}"
+    teacher_hits = sum(1 for kw in _TEACHER_KEYWORDS if kw in text)
+    student_hits = sum(1 for kw in _STUDENT_KEYWORDS if kw in text)
+    if teacher_hits > student_hits and teacher_hits > 0:
+        return "teacher"
+    if student_hits > teacher_hits and student_hits > 0:
+        return "student"
+    return "general"
+
 
 def _sub_chunks_from_chunk(
         chunk_content: str,
@@ -83,6 +102,9 @@ def ingest():
                         metadata.get("h2", ""),
                         metadata.get("h3", ""),
                     ]
+                )
+                metadata["audience_role"] = _infer_audience_role(
+                    metadata["section"], sub
                 )
                 final_docs.append(Document(page_content=sub, metadata=metadata))
 

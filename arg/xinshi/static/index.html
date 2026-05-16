@@ -321,27 +321,37 @@
       thread.scrollTop = thread.scrollHeight;
     }
 
-    function addTyping() {
+    function createAssistantStreamRow() {
       const wrap = document.createElement("div");
       wrap.className = "msg assistant";
-      wrap.id = "typingRow";
       const av = document.createElement("div");
       av.className = "avatar";
       av.textContent = "校";
       const bubble = document.createElement("div");
-      bubble.className = "bubble typing";
-      bubble.textContent = "正在整理回答…";
+      bubble.className = "bubble";
+      bubble.textContent = "";
       wrap.appendChild(av);
       wrap.appendChild(bubble);
       thread.appendChild(wrap);
       thread.scrollTop = thread.scrollHeight;
-    }
-    function removeTyping() {
-      document.getElementById("typingRow")?.remove();
+      return { wrap, bubble };
     }
 
-    async function sendMessage(text) {
-      const res = await fetch("/api/chat", {
+    function appendAssistantText(row, text) {
+      row.bubble.textContent += text;
+      thread.scrollTop = thread.scrollHeight;
+    }
+
+    function setAssistantSources(row, sources) {
+      if (!sources || !sources.length) return;
+      const s = document.createElement("div");
+      s.className = "sources";
+      s.textContent = "参考章节：" + sources.filter(Boolean).join(" · ");
+      row.bubble.appendChild(s);
+    }
+
+    async function sendMessageStream(text, onDelta) {
+      const res = await fetch("/api/chat/stream", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -350,9 +360,72 @@
           use_rewrite: true,
         }),
       });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(data.detail || res.statusText || "请求失败");
-      return data;
+      if (!res.ok) {
+        const textBody = await res.text();
+        throw new Error(textBody || res.statusText || "请求失败");
+      }
+      if (!res.body) throw new Error("流式响应为空");
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let buf = "";
+      let answer = "";
+      let sources = [];
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+
+        while (true) {
+          const splitAt = buf.indexOf("\n\n");
+          if (splitAt < 0) break;
+          const block = buf.slice(0, splitAt);
+          buf = buf.slice(splitAt + 2);
+          const lines = block.split("\n");
+          const dataLines = lines
+            .filter((ln) => ln.startsWith("data:"))
+            .map((ln) => ln.slice(5).trimStart());
+          if (!dataLines.length) continue;
+          const payloadStr = dataLines.join("\n");
+          let payload = null;
+          try {
+            payload = JSON.parse(payloadStr);
+          } catch (_) {
+            continue;
+          }
+          if (!payload || !payload.type) continue;
+
+          if (payload.type === "meta") {
+            if (Array.isArray(payload.sources)) sources = payload.sources;
+            continue;
+          }
+          if (payload.type === "delta") {
+            const delta = String(payload.content || "");
+            if (!delta) continue;
+            // 即使后端一次返回较大 chunk，也切小块渲染，保证“流式可见”。
+            const step = 8;
+            for (let i = 0; i < delta.length; i += step) {
+              const piece = delta.slice(i, i + step);
+              answer += piece;
+              onDelta(piece);
+              if (delta.length > step) {
+                await new Promise((r) => setTimeout(r, 8));
+              }
+            }
+            continue;
+          }
+          if (payload.type === "done") {
+            if (!answer && payload.answer) answer = String(payload.answer);
+            if (Array.isArray(payload.sources)) sources = payload.sources;
+            continue;
+          }
+          if (payload.type === "error") {
+            throw new Error(payload.detail || "流式请求失败");
+          }
+        }
+      }
+      return { answer, sources };
     }
 
     form.addEventListener("submit", async (e) => {
@@ -362,18 +435,19 @@
       input.value = "";
       addMessage("user", text);
       sendBtn.disabled = true;
-      addTyping();
+      const streamRow = createAssistantStreamRow();
       try {
-        const data = await sendMessage(text);
-        removeTyping();
-        addMessage("assistant", data.answer || "", data.sources);
+        const data = await sendMessageStream(text, (delta) => {
+          appendAssistantText(streamRow, delta);
+        });
+        setAssistantSources(streamRow, data.sources || []);
         chatHistory.push({ role: "user", content: text });
         chatHistory.push({ role: "assistant", content: data.answer || "" });
         if (chatHistory.length > MAX_HISTORY) {
           chatHistory = chatHistory.slice(-MAX_HISTORY);
         }
       } catch (err) {
-        removeTyping();
+        streamRow.wrap.remove();
         addMessage("assistant", "出错了：" + (err.message || String(err)));
       }
       sendBtn.disabled = false;

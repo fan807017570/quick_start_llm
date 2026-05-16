@@ -2,12 +2,18 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import Iterator
 
 from arg.xinshi.logutil import configure_logging, preview_text
 
 configure_logging()
 
-from arg.xinshi.config import MAX_HISTORY_MESSAGES, TOP_K_RETRIEVE, TOP_K_RERANK
+from arg.xinshi.config import (
+    MAX_HISTORY_MESSAGES,
+    ROLE_FILTER_MULTIPLIER,
+    TOP_K_RETRIEVE,
+    TOP_K_RERANK,
+)
 from arg.xinshi.llm import get_llm
 from arg.xinshi.reranker import BGEReranker
 from arg.xinshi.retriever import get_vectorstore
@@ -35,16 +41,65 @@ def reload_vectorstore() -> None:
     log.info("vectorstore reloaded in %.2fs", time.perf_counter() - t0)
 
 
+_TEACHER_QUERY_KEYWORDS = ("老师", "教师", "班主任", "师资", "教职工", "名师")
+_STUDENT_QUERY_KEYWORDS = ("学生", "同学", "学子", "招生", "报名", "宿舍", "食宿")
+
+
+def _infer_query_role(query: str) -> str:
+    teacher_hits = sum(1 for kw in _TEACHER_QUERY_KEYWORDS if kw in query)
+    student_hits = sum(1 for kw in _STUDENT_QUERY_KEYWORDS if kw in query)
+    if teacher_hits > student_hits and teacher_hits > 0:
+        return "teacher"
+    if student_hits > teacher_hits and student_hits > 0:
+        return "student"
+    return "general"
+
+
+def _infer_doc_role(doc) -> str:
+    role = (doc.metadata or {}).get("audience_role")
+    if role in ("teacher", "student", "general"):
+        return role
+
+    text = f"{(doc.metadata or {}).get('section', '')}\n{doc.page_content or ''}"
+    teacher_hits = sum(1 for kw in _TEACHER_QUERY_KEYWORDS if kw in text)
+    student_hits = sum(1 for kw in _STUDENT_QUERY_KEYWORDS if kw in text)
+    if teacher_hits > student_hits and teacher_hits > 0:
+        return "teacher"
+    if student_hits > teacher_hits and student_hits > 0:
+        return "student"
+    return "general"
+
+
 def retrieve(query: str):
     t0 = time.perf_counter()
-    docs = vectorstore.similarity_search(query, k=TOP_K_RETRIEVE)
+    query_role = _infer_query_role(query)
+    initial_k = TOP_K_RETRIEVE
+    if query_role in ("teacher", "student"):
+        initial_k = TOP_K_RETRIEVE * ROLE_FILTER_MULTIPLIER
+
+    docs = vectorstore.similarity_search(query, k=initial_k)
+    retrieved_count = len(docs)
     t1 = time.perf_counter()
+    if query_role in ("teacher", "student"):
+        role_docs = [
+            d for d in docs if _infer_doc_role(d) in (query_role, "general")
+        ]
+        if role_docs:
+            docs = role_docs
+
+    filtered_count = len(docs)
     docs = reranker.rerank(query, docs, TOP_K_RERANK)
     t2 = time.perf_counter()
     log.info(
-        "retrieve: similarity_search=%.3fs rerank=%.3fs final_docs=%d",
+        (
+            "retrieve: role=%s similarity_search=%.3fs rerank=%.3fs "
+            "retrieved=%d filtered=%d final_docs=%d"
+        ),
+        query_role,
         t1 - t0,
         t2 - t1,
+        retrieved_count,
+        filtered_count,
         len(docs),
     )
     log.debug(
@@ -98,6 +153,27 @@ def _message_text(msg) -> str:
     if isinstance(msg, str):
         return msg
     return getattr(msg, "content", str(msg))
+
+
+def _chunk_text(chunk) -> str:
+    """从 LangChain 的流式 chunk 中提取可展示文本。"""
+    if isinstance(chunk, str):
+        return chunk
+    content = getattr(chunk, "content", "")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            if isinstance(item, dict):
+                txt = item.get("text") or item.get("content")
+                if isinstance(txt, str):
+                    parts.append(txt)
+        return "".join(parts)
+    return ""
 
 
 def contextualize_for_search(
@@ -221,6 +297,74 @@ def answer_question(
             use_rewrite,
         )
         raise
+
+
+def stream_answer_question(
+    user_message: str,
+    *,
+    history: list[dict[str, str]] | None = None,
+    use_rewrite: bool = True,
+) -> Iterator[dict]:
+    """流式版本：先检索，再按 chunk 逐步输出回答文本。"""
+    t_all = time.perf_counter()
+    hist = history or []
+    hist = hist[-MAX_HISTORY_MESSAGES:]
+    log.info(
+        "stream_answer_question start use_rewrite=%s history_len=%d user_len=%d preview=%r",
+        use_rewrite,
+        len(hist),
+        len(user_message),
+        preview_text(user_message, 100),
+    )
+
+    t_ctx = time.perf_counter()
+    standalone = contextualize_for_search(user_message, hist if hist else None)
+    log.info(
+        "stream contextualize_for_search in %.3fs preview=%r",
+        time.perf_counter() - t_ctx,
+        preview_text(standalone, 100),
+    )
+
+    if use_rewrite:
+        t_rw = time.perf_counter()
+        q = query_rewrite(standalone)
+        log.info(
+            "stream query_rewrite done in %.3fs preview=%r",
+            time.perf_counter() - t_rw,
+            preview_text(q, 100),
+        )
+    else:
+        q = standalone
+
+    docs = retrieve(q)
+    sources = [d.metadata.get("section") or "" for d in docs]
+    prompt = build_prompt(user_message.strip(), docs, history=hist)
+    llm = get_llm()
+
+    yield {
+        "type": "meta",
+        "sources": sources,
+        "rewritten_query": q if use_rewrite else None,
+        "standalone_query": standalone,
+    }
+
+    t_llm = time.perf_counter()
+    answer_parts: list[str] = []
+    for chunk in llm.stream(prompt):
+        text = _chunk_text(chunk)
+        if not text:
+            continue
+        answer_parts.append(text)
+        yield {"type": "delta", "content": text}
+
+    answer = "".join(answer_parts).strip()
+    log.info(
+        "stream llm done in %.3fs answer_len=%d total=%.3fs",
+        time.perf_counter() - t_llm,
+        len(answer),
+        time.perf_counter() - t_all,
+    )
+    yield {"type": "done", "answer": answer, "sources": sources}
 
 
 def main():

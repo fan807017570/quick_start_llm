@@ -37,9 +37,9 @@ services:
     volumes:
       - hf_cache:/app/hf_cache
       # 宿主机知识库目录 -> 容器 ingest 读取目录
-      - "${XINSHI_BASE_DATA_DIR:-./data/base}:/app/arg/xinshi/data/base:ro"
+      - "${XINSHI_BASE_DATA_DIR:-/opt/xinshi/data/docs}:/app/arg/xinshi/data/base:ro"
       # 宿主机上传目录 -> 容器 Web 上传/列举目录
-      - "${XINSHI_DOCS_DATA_DIR:-./data/docs}:/app/arg/xinshi/data/docs"
+      - "${XINSHI_DOCS_DATA_DIR:-/opt/xinshi/data/docs}:/app/arg/xinshi/data/docs"
       # 宿主机 embedding 模型目录 -> 容器 ingest/retriever 读取目录
       - "${XINSHI_EMBEDDING_MODEL_DIR:-/opt/models/bge-base-zh-v1.5}:/app/models/bge-base-zh-v1.5:ro"
       # 宿主机 rerank 模型目录 -> 容器 reranker 读取目录

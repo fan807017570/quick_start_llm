@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import sys
@@ -33,7 +34,7 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from arg.xinshi.config import MAX_HISTORY_MESSAGES
@@ -42,7 +43,7 @@ from arg.xinshi.logutil import configure_logging, preview_text
 configure_logging()
 log = logging.getLogger(__name__)
 
-from arg.xinshi.application import answer_question
+from arg.xinshi.application import answer_question, stream_answer_question
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 DOCS_DIR = Path(__file__).resolve().parent / "data" / "docs"
@@ -145,6 +146,44 @@ async def chat(req: ChatRequest):
     except Exception as e:
         log.exception("chat endpoint error: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    hist = [m.model_dump() for m in req.history[-MAX_HISTORY_MESSAGES:]]
+    log.info(
+        "chat_stream request use_rewrite=%s history=%d message_len=%d preview=%r",
+        req.use_rewrite,
+        len(hist),
+        len(req.message),
+        preview_text(req.message, 80),
+    )
+
+    def _sse(payload: dict) -> str:
+        return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def _iter_events():
+        try:
+            for item in stream_answer_question(
+                req.message.strip(),
+                history=hist,
+                use_rewrite=req.use_rewrite,
+            ):
+                yield _sse(item)
+        except Exception as exc:
+            log.exception("chat_stream endpoint error: %s", exc)
+            yield _sse({"type": "error", "detail": str(exc)})
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",
+    }
+    return StreamingResponse(
+        _iter_events(),
+        media_type="text/event-stream; charset=utf-8",
+        headers=headers,
+    )
 
 
 @app.get("/api/docs", summary="列出 data/docs 目录下的所有文件")
