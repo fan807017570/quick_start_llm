@@ -56,7 +56,7 @@ DOCS_DIR.mkdir(parents=True, exist_ok=True)
 _ALLOWED_SUFFIXES = {".md", ".txt"}
 # 安全文件名：只允许字母、数字、连字符、下划线、点
 _SAFE_FILENAME_RE = re.compile(r"^[\w\-. ]+$")
-_WECHAT_TOKEN_ENV = "807017570"
+_WECHAT_TOKEN_ENV = "WECHAT_TOKEN"
 
 app = FastAPI(title="新实中学招生顾问", version="1.0")
 
