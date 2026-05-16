@@ -15,8 +15,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -32,9 +35,9 @@ if str(_ROOT) not in sys.path:
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from arg.xinshi.config import MAX_HISTORY_MESSAGES
@@ -53,6 +56,7 @@ DOCS_DIR.mkdir(parents=True, exist_ok=True)
 _ALLOWED_SUFFIXES = {".md", ".txt"}
 # 安全文件名：只允许字母、数字、连字符、下划线、点
 _SAFE_FILENAME_RE = re.compile(r"^[\w\-. ]+$")
+_WECHAT_TOKEN_ENV = "807017570"
 
 app = FastAPI(title="新实中学招生顾问", version="1.0")
 
@@ -116,6 +120,39 @@ class ChatResponse(BaseModel):
     )
 
 
+def _verify_wechat_signature(signature: str, timestamp: str, nonce: str) -> bool:
+    token = os.environ.get(_WECHAT_TOKEN_ENV, "").strip()
+    if not token:
+        log.warning("%s is not configured; reject WeChat validation request", _WECHAT_TOKEN_ENV)
+        return False
+
+    raw = "".join(sorted([token, timestamp, nonce]))
+    expected = hashlib.sha1(raw.encode("utf-8")).hexdigest()
+    return hmac.compare_digest(expected, signature)
+
+
+def _handle_chat_request(req: ChatRequest) -> ChatResponse:
+    hist = [m.model_dump() for m in req.history[-MAX_HISTORY_MESSAGES:]]
+    log.info(
+        "chat request use_rewrite=%s history=%d message_len=%d preview=%r",
+        req.use_rewrite,
+        len(hist),
+        len(req.message),
+        preview_text(req.message, 80),
+    )
+    out = answer_question(
+        req.message.strip(),
+        history=hist,
+        use_rewrite=req.use_rewrite,
+    )
+    return ChatResponse(
+        answer=out["answer"],
+        sources=out["sources"],
+        rewritten_query=out.get("rewritten_query"),
+        standalone_query=out.get("standalone_query"),
+    )
+
+
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
@@ -124,27 +161,33 @@ async def health():
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     try:
-        hist = [m.model_dump() for m in req.history[-MAX_HISTORY_MESSAGES:]]
-        log.info(
-            "chat request use_rewrite=%s history=%d message_len=%d preview=%r",
-            req.use_rewrite,
-            len(hist),
-            len(req.message),
-            preview_text(req.message, 80),
-        )
-        out = answer_question(
-            req.message.strip(),
-            history=hist,
-            use_rewrite=req.use_rewrite,
-        )
-        return ChatResponse(
-            answer=out["answer"],
-            sources=out["sources"],
-            rewritten_query=out.get("rewritten_query"),
-            standalone_query=out.get("standalone_query"),
-        )
+        return _handle_chat_request(req)
     except Exception as e:
         log.exception("chat endpoint error: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/api/chat", response_model=ChatResponse)
+async def chat_wechat_validation(
+    signature: str = Query(..., description="微信加密签名"),
+    timestamp: str = Query(..., description="时间戳"),
+    nonce: str = Query(..., description="随机数"),
+    echostr: str = Query(..., description="随机字符串"),
+):
+    if not _verify_wechat_signature(signature, timestamp, nonce):
+        log.warning(
+            "invalid WeChat signature timestamp=%s nonce=%s echostr_len=%d",
+            timestamp,
+            nonce,
+            len(echostr),
+        )
+        return PlainTextResponse("", status_code=403)
+
+    log.info("valid WeChat signature; dispatch echostr to chat handler len=%d", len(echostr))
+    try:
+        return _handle_chat_request(ChatRequest(message=echostr))
+    except Exception as e:
+        log.exception("wechat validation chat dispatch error: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
