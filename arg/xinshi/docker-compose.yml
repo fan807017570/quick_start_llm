@@ -43,7 +43,7 @@ services:
       # 宿主机 embedding 模型目录 -> 容器 ingest/retriever 读取目录
       - "${XINSHI_EMBEDDING_MODEL_DIR:-/opt/models/bge-base-zh-v1.5}:/app/models/bge-base-zh-v1.5:ro"
       # 宿主机 rerank 模型目录 -> 容器 reranker 读取目录
-      - "${XINSHI_RERANK_MODEL_DIR:-/opt/models/bge-reranker-large}:/app/models/bge-reranker-large:ro"
+      - "${XINSHI_RERANK_MODEL_DIR:-/opt/models/bge-reranker-base}:/app/models/bge-reranker-base:ro"
     depends_on:
       milvus-standalone:
         condition: service_healthy
