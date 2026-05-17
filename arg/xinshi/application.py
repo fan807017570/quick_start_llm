@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import re
 import time
 from typing import Iterator
 
@@ -56,20 +55,7 @@ _ALUMNI_REWRITE_TERMS = (
     "创业",
     "企业家",
 )
-_CONTEXTUALIZE_HISTORY_LIMIT = 4
-_FOLLOWUP_ONLY_RE = re.compile(
-    r"^(还有吗|还有呢|还有没有|还有什么|还有哪些|呢|然后呢|具体呢|怎么说|可以吗|行吗|真的吗|"
-    r"什么意思|详细说说|展开说说)[？?。！!]*$"
-)
-_REFERENCE_RE = re.compile(
-    r"(那里|那边|这边|这里|这个|那个|这些|那些|它|他们|她们|他|她|刚才|刚刚|前面|上面|上一条|同上)"
-)
-_SELF_CONTAINED_QUERY_KEYWORDS = (
-    "新实", "学校", "地址", "位置", "校址", "面积", "校长", "老师", "教师", "师资",
-    "学费", "收费", "费用", "招生", "报名", "入学", "宿舍", "食堂", "食宿", "校园",
-    "课程", "班级", "高考", "中考", "艺考", "电话", "联系", "分数", "录取",
-    "校友", "杰出校友", "优秀校友", "创业", "企业家", "毕业生",
-)
+_RETRIEVE_SCORE_THRESHOLD = 0.2
 
 
 def _infer_query_role(query: str) -> str:
@@ -97,6 +83,45 @@ def _infer_doc_role(doc) -> str:
     return "general"
 
 
+def _retrieve_metric_type() -> str:
+    search_params = getattr(vectorstore, "search_params", None) or {}
+    metric_type = search_params.get("metric_type")
+    if metric_type:
+        return str(metric_type).upper()
+
+    get_index = getattr(vectorstore, "_get_index", None)
+    if callable(get_index):
+        index = get_index() or {}
+        metric_type = (index.get("index_param") or {}).get("metric_type")
+        if metric_type:
+            return str(metric_type).upper()
+
+    return "L2"
+
+
+def _to_relevance_score(raw_score: float, metric_type: str) -> float:
+    if metric_type == "L2":
+        return 1.0 / (1.0 + max(raw_score, 0.0))
+    return raw_score
+
+
+def _similarity_search_with_score_filter(query: str, k: int):
+    scored_docs = vectorstore.similarity_search_with_score(query, k=k)
+    metric_type = _retrieve_metric_type()
+    docs = []
+    for doc, raw_score in scored_docs:
+        raw_score = float(raw_score)
+        score = _to_relevance_score(raw_score, metric_type)
+        metadata = dict(doc.metadata or {})
+        metadata["retrieve_score"] = score
+        metadata["retrieve_raw_score"] = raw_score
+        metadata["retrieve_metric_type"] = metric_type
+        doc.metadata = metadata
+        if score >= _RETRIEVE_SCORE_THRESHOLD:
+            docs.append(doc)
+    return docs, len(scored_docs), metric_type
+
+
 def retrieve(query: str):
     t0 = time.perf_counter()
     query_role = _infer_query_role(query)
@@ -104,8 +129,10 @@ def retrieve(query: str):
     if query_role in ("teacher", "student"):
         initial_k = TOP_K_RETRIEVE * ROLE_FILTER_MULTIPLIER
 
-    docs = vectorstore.similarity_search(query, k=initial_k)
-    retrieved_count = len(docs)
+    docs, retrieved_count, metric_type = _similarity_search_with_score_filter(
+        query, initial_k
+    )
+    score_filtered_count = len(docs)
     t1 = time.perf_counter()
     if query_role in ("teacher", "student"):
         role_docs = [
@@ -120,12 +147,16 @@ def retrieve(query: str):
     log.info(
         (
             "retrieve: role=%s similarity_search=%.3fs rerank=%.3fs "
-            "retrieved=%d filtered=%d final_docs=%d"
+            "retrieved=%d metric=%s score_threshold=%.2f score_filtered=%d "
+            "role_filtered=%d final_docs=%d"
         ),
         query_role,
         t1 - t0,
         t2 - t1,
         retrieved_count,
+        metric_type,
+        _RETRIEVE_SCORE_THRESHOLD,
+        score_filtered_count,
         filtered_count,
         len(docs),
     )
@@ -164,10 +195,10 @@ def build_prompt(
     ])
     hist = _format_history_block(history)
     return f"""
-    你是新实中学的招生顾问。回答要亲切、准确、简洁，先直接回答结论。
+    你是新实中学的招生顾问。回答要亲切自然、有温度、准确、简洁，先直接回答结论。
     要求：
     - 只基于「内部参考」回答，不编造，不夸张承诺。
-    - 默认 2-5 句，尽量 150 字以内；只有用户问多个点时才用最多 5 条短列表。
+    - 默认 4-6 句，尽量 250 字以内；只有用户问多个点时才用最多 7 条短列表。
     - 避免啰嗦寒暄和套话；不要说「根据资料显示」「据资料」「综上所述」「从文档中可以看到」。
     - 内部参考没有的信息，直接说「目前资料里没看到」，并建议通过官方渠道确认。
     - 追问上一话题时自然承接，不重复介绍背景。
@@ -206,21 +237,6 @@ def _chunk_text(chunk) -> str:
     return ""
 
 
-def _needs_contextualize(text: str) -> bool:
-    compact = re.sub(r"\s+", "", text.strip())
-    if not compact:
-        return False
-    if _FOLLOWUP_ONLY_RE.fullmatch(compact):
-        return True
-    if not _REFERENCE_RE.search(compact):
-        return False
-
-    # 已包含明确业务关键词的问题通常可以直接检索，避免额外 LLM 改写。
-    if any(kw in compact for kw in _SELF_CONTAINED_QUERY_KEYWORDS):
-        return False
-    return len(compact) <= 20
-
-
 def contextualize_for_search(
     user_message: str,
     history: list[dict[str, str]] | None,
@@ -229,12 +245,9 @@ def contextualize_for_search(
     text = user_message.strip()
     if not history:
         return text
-    if not _needs_contextualize(text):
-        log.info("contextualize skipped by rule preview=%r", preview_text(text, 80))
-        return text
 
     lines: list[str] = []
-    for m in history[-_CONTEXTUALIZE_HISTORY_LIMIT:]:
+    for m in history[-MAX_HISTORY_MESSAGES:]:
         role = m.get("role", "")
         content = (m.get("content") or "").strip()
         if not content:
@@ -263,9 +276,6 @@ def contextualize_for_search(
 
 
 def query_rewrite(query: str) -> str:
-    if any(kw in query for kw in _ALUMNI_QUERY_KEYWORDS):
-        return f"{query} {' '.join(_ALUMNI_REWRITE_TERMS)}"
-
     llm = get_llm()
     prompt = f"""
     将用户问题改写成更适合向量检索的查询（可补充同义词，但不要改变主题）。
@@ -276,7 +286,6 @@ def query_rewrite(query: str) -> str:
     - 问老师/教师/师资 → 保留并补充：教师团队、师资力量、专兼职教师、教职工 等词。
     - 问费用/学费/收费 → 保留并补充：收费标准、学费、住宿费、费用 等词。
     - 问招生/报名/入学 → 保留并补充：招生简章、报名条件、入学要求、招生政策 等词。
-    - 问校友/杰出校友/创业成功人士 → 保留并补充：杰出校友风采、创业成功人士榜单、程科源、黄亮、翁艇、校友、毕业生、创业、企业家；不要改成高考成绩或优秀学生录取榜单。
     - 不要改成与原文无关的主题（例如把校长问句改成招生政策）。
     只输出改写后的一句话，不要解释。
     用户问题：{query}
