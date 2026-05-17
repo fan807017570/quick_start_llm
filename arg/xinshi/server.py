@@ -47,6 +47,8 @@ from arg.xinshi.wechat_service import (
     WeChatPayloadError,
     WeChatSignatureError,
     build_encrypted_chat_reply,
+    parse_encrypted_envelope,
+    render_encrypted_envelope,
 )
 
 configure_logging()
@@ -99,27 +101,6 @@ app.add_middleware(
 )
 
 
-async def _read_json_body(request: Request) -> dict:
-    raw = await request.body()
-    raw_text = raw.decode("utf-8", errors="replace")
-    log.info(
-        "wechat request raw body len=%d content_type=%r preview=%r",
-        len(raw),
-        request.headers.get("content-type"),
-        raw_text[:1000],
-    )
-    try:
-        payload = json.loads(raw_text)
-    except json.JSONDecodeError as exc:
-        log.warning("wechat request body is not valid JSON: %s", exc)
-        raise HTTPException(status_code=400, detail="请求体不是合法 JSON") from exc
-
-    if not isinstance(payload, dict):
-        log.warning("wechat request JSON body is not object: type=%s", type(payload).__name__)
-        raise HTTPException(status_code=400, detail="请求体 JSON 必须是对象")
-    return payload
-
-
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
@@ -138,10 +119,11 @@ async def chat_wechat_message(
     if encrypt_type and encrypt_type != "aes":
         raise HTTPException(status_code=400, detail="仅支持 encrypt_type=aes")
 
-    payload = await _read_json_body(request)
+    raw_body = await request.body()
     try:
+        envelope = parse_encrypted_envelope(raw_body, request.headers.get("content-type"))
         encrypted_reply = build_encrypted_chat_reply(
-            payload,
+            envelope.payload,
             msg_signature=msg_signature,
             timestamp=timestamp,
             nonce=nonce,
@@ -159,7 +141,11 @@ async def chat_wechat_message(
 
     if encrypted_reply is None:
         return PlainTextResponse("success")
-    return JSONResponse(content=encrypted_reply)
+    rendered_reply = render_encrypted_envelope(encrypted_reply, envelope.body_format)
+    if envelope.body_format == "xml":
+        log.info("wechat response encrypted xml=%s", rendered_reply)
+        return PlainTextResponse(rendered_reply, media_type="application/xml; charset=utf-8")
+    return JSONResponse(content=rendered_reply)
 
 
 @app.get("/api/chat", response_model=ChatResponse)

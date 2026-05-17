@@ -125,7 +125,7 @@ def _aes_encrypt(plain: bytes, config: WeChatConfig) -> str:
     return base64.b64encode(encrypted).decode("utf-8")
 
 
-def decrypt_json_payload(encrypt: str, config: WeChatConfig | None = None) -> dict:
+def decrypt_text_payload(encrypt: str, config: WeChatConfig | None = None) -> str:
     config = config or WeChatConfig.from_env()
     full = _aes_decrypt(encrypt, config)
     if len(full) < 20:
@@ -142,8 +142,13 @@ def decrypt_json_payload(encrypt: str, config: WeChatConfig | None = None) -> di
     if appid != config.appid:
         raise WeChatCryptoError("微信 Appid 不匹配", 403)
 
+    return msg_bytes.decode("utf-8")
+
+
+def decrypt_json_payload(encrypt: str, config: WeChatConfig | None = None) -> dict:
+    msg_text = decrypt_text_payload(encrypt, config)
     try:
-        msg = json.loads(msg_bytes.decode("utf-8"))
+        msg = json.loads(msg_text)
     except json.JSONDecodeError as exc:
         raise WeChatCryptoError("微信密文明文不是合法 JSON") from exc
 
@@ -152,8 +157,8 @@ def decrypt_json_payload(encrypt: str, config: WeChatConfig | None = None) -> di
     return msg
 
 
-def encrypt_json_payload(
-    message: dict,
+def encrypt_text_payload(
+    message_text: str,
     timestamp: str,
     nonce: str,
     config: WeChatConfig | None = None,
@@ -164,7 +169,7 @@ def encrypt_json_payload(
     if len(random_part) != 16:
         raise WeChatCryptoError("微信加密 random 必须为 16 字节", 500)
 
-    msg = json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    msg = message_text.encode("utf-8")
     full = random_part + len(msg).to_bytes(4, "big") + msg + config.appid.encode("utf-8")
     encrypted = _aes_encrypt(full, config)
     try:
@@ -177,3 +182,14 @@ def encrypt_json_payload(
         "TimeStamp": timestamp_value,
         "Nonce": nonce,
     }
+
+
+def encrypt_json_payload(
+    message: dict,
+    timestamp: str,
+    nonce: str,
+    config: WeChatConfig | None = None,
+    random_bytes: bytes | None = None,
+) -> dict:
+    msg = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
+    return encrypt_text_payload(msg, timestamp, nonce, config, random_bytes)

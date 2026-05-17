@@ -306,7 +306,7 @@ def stream_answer_question(
     use_rewrite: bool = True,
 ) -> Iterator[dict]:
     """流式版本：先检索，再按 chunk 逐步输出回答文本。"""
-    t_all = time.perf_counter()
+    t_all = time.perf_counter   ()
     hist = history or []
     hist = hist[-MAX_HISTORY_MESSAGES:]
     log.info(
