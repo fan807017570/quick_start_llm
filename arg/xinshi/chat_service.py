@@ -3,6 +3,13 @@ from __future__ import annotations
 import logging
 import os
 import re
+import json
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from collections.abc import Iterator
 from datetime import datetime
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -15,6 +22,22 @@ from arg.xinshi.schemas import ChatRequest, ChatResponse
 log = logging.getLogger(__name__)
 
 _APP_TIMEZONE = os.environ.get("APP_TIMEZONE", "Asia/Shanghai")
+_WECHAT_APPID = os.environ.get("WECHAT_APPID", "").strip()
+_WECHAT_APPSECRET = os.environ.get("WECHAT_APPSECRET", "").strip()
+_WECHAT_ACCESS_TOKEN = os.environ.get("WECHAT_ACCESS_TOKEN", "").strip()
+_WECHAT_TOKEN_EXPIRE_SKEW_SECONDS = 120
+_WECHAT_CUSTOM_REPLY_WORKERS = max(1, int(os.environ.get("WECHAT_CUSTOM_REPLY_WORKERS", "2")))
+_WECHAT_CUSTOM_REPLY_TIMEOUT = max(1, int(os.environ.get("WECHAT_CUSTOM_REPLY_TIMEOUT", "10")))
+_WECHAT_CUSTOM_REPLY_MAX_BYTES = max(256, int(os.environ.get("WECHAT_CUSTOM_REPLY_MAX_BYTES", "1800")))
+_WECHAT_TOKEN_API = "https://api.weixin.qq.com/cgi-bin/token"
+_WECHAT_CUSTOM_SEND_API = "https://api.weixin.qq.com/cgi-bin/message/custom/send"
+_wechat_reply_executor = ThreadPoolExecutor(
+    max_workers=_WECHAT_CUSTOM_REPLY_WORKERS,
+    thread_name_prefix="wechat-reply",
+)
+_wechat_token_lock = threading.Lock()
+_wechat_cached_access_token = ""
+_wechat_cached_access_token_expires_at = 0.0
 _MACHINE_TOKEN_RE = re.compile(r"^[A-Za-z0-9._~+=:/-]+$")
 _HEX_TOKEN_RE = re.compile(r"^[0-9a-fA-F]{8,}$")
 _BASE64ISH_TOKEN_RE = re.compile(r"^[A-Za-z0-9+/]{12,}={0,2}$")
@@ -95,7 +118,7 @@ def _history_for(req: ChatRequest) -> list[dict[str, str]]:
     return [m.model_dump() for m in req.history[-MAX_HISTORY_MESSAGES:]]
 
 
-def handle_chat_request(req: ChatRequest) -> ChatResponse:
+def _chat_response(req: ChatRequest) -> ChatResponse:
     date_resp = _date_chat_response(req.message)
     if date_resp is not None:
         return date_resp
@@ -127,6 +150,165 @@ def handle_chat_request(req: ChatRequest) -> ChatResponse:
         rewritten_query=out.get("rewritten_query"),
         standalone_query=out.get("standalone_query"),
     )
+
+
+def _empty_chat_response() -> ChatResponse:
+    return ChatResponse(answer="", sources=[], rewritten_query=None, standalone_query=None)
+
+
+def _get_wechat_access_token(*, force_refresh: bool = False) -> str:
+    global _wechat_cached_access_token, _wechat_cached_access_token_expires_at
+
+    if _WECHAT_ACCESS_TOKEN and not force_refresh:
+        return _WECHAT_ACCESS_TOKEN
+
+    now = time.time()
+    with _wechat_token_lock:
+        if (
+            not force_refresh
+            and _wechat_cached_access_token
+            and now < _wechat_cached_access_token_expires_at
+        ):
+            return _wechat_cached_access_token
+
+        if not _WECHAT_APPID or not _WECHAT_APPSECRET:
+            raise RuntimeError("缺少 WECHAT_APPID/WECHAT_APPSECRET，无法调用微信客服接口")
+
+        query = urllib.parse.urlencode({
+            "grant_type": "client_credential",
+            "appid": _WECHAT_APPID,
+            "secret": _WECHAT_APPSECRET,
+        })
+        url = f"{_WECHAT_TOKEN_API}?{query}"
+        with urllib.request.urlopen(url, timeout=_WECHAT_CUSTOM_REPLY_TIMEOUT) as resp:
+            body = resp.read().decode("utf-8")
+        data = json.loads(body)
+        access_token = data.get("access_token")
+        if not access_token:
+            raise RuntimeError(f"获取微信 access_token 失败: {data}")
+
+        expires_in = int(data.get("expires_in") or 7200)
+        _wechat_cached_access_token = str(access_token)
+        _wechat_cached_access_token_expires_at = (
+            time.time() + max(60, expires_in - _WECHAT_TOKEN_EXPIRE_SKEW_SECONDS)
+        )
+        return _wechat_cached_access_token
+
+
+def _post_wechat_customer_text(openid: str, content: str, *, force_refresh_token: bool = False) -> dict:
+    access_token = _get_wechat_access_token(force_refresh=force_refresh_token)
+    url = f"{_WECHAT_CUSTOM_SEND_API}?access_token={urllib.parse.quote(access_token)}"
+    payload = {
+        "touser": openid,
+        "msgtype": "text",
+        "text": {"content": content},
+    }
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json; charset=utf-8"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=_WECHAT_CUSTOM_REPLY_TIMEOUT) as resp:
+        raw = resp.read().decode("utf-8")
+    return json.loads(raw)
+
+
+def _split_text_by_bytes(text: str, max_bytes: int) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    current_bytes = 0
+    for ch in text:
+        ch_bytes = len(ch.encode("utf-8"))
+        if current and current_bytes + ch_bytes > max_bytes:
+            parts.append("".join(current))
+            current = []
+            current_bytes = 0
+        current.append(ch)
+        current_bytes += ch_bytes
+    if current:
+        parts.append("".join(current))
+    return parts or [""]
+
+
+def _send_wechat_customer_text(openid: str, content: str) -> None:
+    if not openid:
+        raise RuntimeError("缺少微信 openid，无法发送客服消息")
+
+    text = content.strip() or "抱歉，暂时没有生成有效回复。"
+    for idx, part in enumerate(_split_text_by_bytes(text, _WECHAT_CUSTOM_REPLY_MAX_BYTES), start=1):
+        result = _post_wechat_customer_text(openid, part)
+        if result.get("errcode") in (40001, 42001):
+            result = _post_wechat_customer_text(openid, part, force_refresh_token=True)
+        if result.get("errcode") != 0:
+            raise RuntimeError(f"微信客服消息发送失败: {result}")
+        log.info(
+            "wechat customer reply sent openid=%s part=%d bytes=%d",
+            openid,
+            idx,
+            len(part.encode("utf-8")),
+        )
+
+
+def _run_wechat_async_reply(req: ChatRequest, openid: str) -> None:
+    t0 = time.perf_counter()
+    log.info(
+        "wechat async chat started openid=%s use_rewrite=%s message_len=%d preview=%r",
+        openid,
+        req.use_rewrite,
+        len(req.message),
+        preview_text(req.message, 80),
+    )
+    try:
+        resp = _chat_response(req)
+    except Exception:
+        log.exception("wechat async answer_question failed openid=%s", openid)
+        try:
+            _send_wechat_customer_text(openid, "抱歉，刚才的问题暂时处理失败，请稍后再试。")
+        except Exception:
+            log.exception("wechat async failure notice failed openid=%s", openid)
+        return
+
+    try:
+        _send_wechat_customer_text(openid, resp.answer)
+        log.info(
+            "wechat async chat completed openid=%s elapsed=%.3fs answer_len=%d",
+            openid,
+            time.perf_counter() - t0,
+            len(resp.answer),
+        )
+    except Exception:
+        log.exception("wechat customer reply failed openid=%s", openid)
+
+
+def handle_chat_request(
+    req: ChatRequest,
+    *,
+    wechat_openid: str | None = None,
+    async_wechat_reply: bool = False,
+) -> ChatResponse:
+    if async_wechat_reply:
+        openid = (wechat_openid or "").strip()
+        if not openid:
+            log.warning("wechat async reply requested without openid")
+            return _empty_chat_response()
+
+        queued_req = ChatRequest(
+            message=req.message,
+            history=req.history,
+            use_rewrite=req.use_rewrite,
+        )
+        _wechat_reply_executor.submit(_run_wechat_async_reply, queued_req, openid)
+        log.info(
+            "wechat async chat queued openid=%s workers=%d message_len=%d",
+            openid,
+            _WECHAT_CUSTOM_REPLY_WORKERS,
+            len(req.message),
+        )
+        return _empty_chat_response()
+
+    return _chat_response(req)
 
 
 def iter_stream_chat_events(req: ChatRequest) -> Iterator[dict]:

@@ -28,7 +28,7 @@ services:
     environment:
       # DeepSeek API Key（必填，或写入 .env 文件）
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
-      - DEEPSEEK_MODEL=deepseek-chat
+      - DEEPSEEK_MODEL=deepseek-v4-pro
       # 容器内通过服务名访问 milvus，端口仍是内部 19530
       - MILVUS_HOST=milvus-standalone
       - MILVUS_PORT=19530

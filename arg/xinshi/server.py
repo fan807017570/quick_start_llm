@@ -140,7 +140,7 @@ async def chat_wechat_message(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
     if encrypted_reply is None:
-        return PlainTextResponse("success")
+        return PlainTextResponse("")
     rendered_reply = render_encrypted_envelope(encrypted_reply, envelope.body_format)
     if envelope.body_format == "xml":
         log.info("wechat response encrypted xml=%s", rendered_reply)

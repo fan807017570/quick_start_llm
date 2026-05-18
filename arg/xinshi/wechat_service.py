@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from dataclasses import dataclass
 from xml.etree import ElementTree
 
@@ -11,7 +10,6 @@ from arg.xinshi.logutil import preview_text
 from arg.xinshi.schemas import ChatRequest
 from arg.xinshi.wechat_crypto import (
     decrypt_text_payload,
-    encrypt_text_payload,
     verify_msg_signature,
 )
 
@@ -183,17 +181,12 @@ def build_encrypted_chat_reply(
         len(content),
         preview_text(content, 80),
     )
-    chat_resp = handle_chat_request(ChatRequest(message=content))
-    now = int(time.time())
-    reply_message = {
-        "ToUserName": msg.get("FromUserName") or openid or "",
-        "FromUserName": msg.get("ToUserName") or "",
-        "CreateTime": now,
-        "MsgType": "text",
-        "Content": chat_resp.answer,
-    }
-    reply_plaintext = _reply_plaintext(reply_message, message_format)
-    log.info("wechat response plaintext payload=%s", reply_plaintext)
-    encrypted_reply = encrypt_text_payload(reply_plaintext, str(now), nonce)
-    log.info("wechat response encrypted payload=%s", _json_for_log(encrypted_reply))
-    return encrypted_reply
+    reply_openid = str(msg.get("FromUserName") or openid or "").strip()
+    handle_chat_request(
+        ChatRequest(message=content),
+        wechat_openid=reply_openid,
+        async_wechat_reply=True,
+    )
+    log.info("wechat response plaintext payload=%s", _json_for_log(""))
+    log.info("wechat response encrypted payload=%s", _json_for_log(None))
+    return None
