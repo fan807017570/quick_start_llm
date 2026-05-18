@@ -6,7 +6,6 @@ import re
 import json
 import threading
 import time
-import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -26,14 +25,19 @@ _WECHAT_APPID = os.environ.get("WECHAT_APPID", "").strip()
 _WECHAT_APPSECRET = os.environ.get("WECHAT_APPSECRET", "").strip()
 _WECHAT_ACCESS_TOKEN = os.environ.get("WECHAT_ACCESS_TOKEN", "").strip()
 _WECHAT_TOKEN_EXPIRE_SKEW_SECONDS = 120
-_WECHAT_CUSTOM_REPLY_WORKERS = max(1, int(os.environ.get("WECHAT_CUSTOM_REPLY_WORKERS", "2")))
+_WECHAT_CUSTOM_REPLY_WORKERS = max(1, int(os.environ.get("WECHAT_CUSTOM_REPLY_WORKERS", "6")))
+_WECHAT_CUSTOM_REPLY_QUEUE_SIZE = max(0, int(os.environ.get("WECHAT_CUSTOM_REPLY_QUEUE_SIZE", "150")))
 _WECHAT_CUSTOM_REPLY_TIMEOUT = max(1, int(os.environ.get("WECHAT_CUSTOM_REPLY_TIMEOUT", "10")))
 _WECHAT_CUSTOM_REPLY_MAX_BYTES = max(256, int(os.environ.get("WECHAT_CUSTOM_REPLY_MAX_BYTES", "1800")))
+_WECHAT_BUSY_MESSAGE = "当前咨询人数较多，请稍后再试"
 _WECHAT_TOKEN_API = "https://api.weixin.qq.com/cgi-bin/token"
 _WECHAT_CUSTOM_SEND_API = "https://api.weixin.qq.com/cgi-bin/message/custom/send"
 _wechat_reply_executor = ThreadPoolExecutor(
     max_workers=_WECHAT_CUSTOM_REPLY_WORKERS,
     thread_name_prefix="wechat-reply",
+)
+_wechat_reply_slots = threading.BoundedSemaphore(
+    _WECHAT_CUSTOM_REPLY_WORKERS + _WECHAT_CUSTOM_REPLY_QUEUE_SIZE
 )
 _wechat_token_lock = threading.Lock()
 _wechat_cached_access_token = ""
@@ -282,6 +286,55 @@ def _run_wechat_async_reply(req: ChatRequest, openid: str) -> None:
         log.exception("wechat customer reply failed openid=%s", openid)
 
 
+def _release_wechat_reply_slot(_future) -> None:
+    try:
+        _wechat_reply_slots.release()
+    except ValueError:
+        log.exception("wechat async reply slot release failed")
+
+
+def _send_wechat_busy_notice(openid: str) -> None:
+    try:
+        _send_wechat_customer_text(openid, _WECHAT_BUSY_MESSAGE)
+        log.info("wechat busy notice sent openid=%s", openid)
+    except Exception:
+        log.exception("wechat busy notice failed openid=%s", openid)
+
+
+def _try_submit_wechat_async_reply(req: ChatRequest, openid: str) -> bool:
+    if not _wechat_reply_slots.acquire(blocking=False):
+        log.warning(
+            "wechat async chat rejected openid=%s workers=%d queue_size=%d message_len=%d",
+            openid,
+            _WECHAT_CUSTOM_REPLY_WORKERS,
+            _WECHAT_CUSTOM_REPLY_QUEUE_SIZE,
+            len(req.message),
+        )
+        threading.Thread(
+            target=_send_wechat_busy_notice,
+            args=(openid,),
+            name="wechat-busy-notice",
+            daemon=True,
+        ).start()
+        return False
+
+    try:
+        future = _wechat_reply_executor.submit(_run_wechat_async_reply, req, openid)
+    except Exception:
+        _wechat_reply_slots.release()
+        log.exception("wechat async chat submit failed openid=%s", openid)
+        threading.Thread(
+            target=_send_wechat_busy_notice,
+            args=(openid,),
+            name="wechat-busy-notice",
+            daemon=True,
+        ).start()
+        return False
+
+    future.add_done_callback(_release_wechat_reply_slot)
+    return True
+
+
 def handle_chat_request(
     req: ChatRequest,
     *,
@@ -299,11 +352,13 @@ def handle_chat_request(
             history=req.history,
             use_rewrite=req.use_rewrite,
         )
-        _wechat_reply_executor.submit(_run_wechat_async_reply, queued_req, openid)
+        submitted = _try_submit_wechat_async_reply(queued_req, openid)
         log.info(
-            "wechat async chat queued openid=%s workers=%d message_len=%d",
+            "wechat async chat queued=%s openid=%s workers=%d queue_size=%d message_len=%d",
+            submitted,
             openid,
             _WECHAT_CUSTOM_REPLY_WORKERS,
+            _WECHAT_CUSTOM_REPLY_QUEUE_SIZE,
             len(req.message),
         )
         return _empty_chat_response()
